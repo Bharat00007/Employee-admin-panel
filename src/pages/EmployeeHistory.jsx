@@ -118,17 +118,21 @@ const EmployeeHistory = () => {
   const handleGetLiveLocation = async () => {
     setLiveRequesting(true);
     const toastId = toast.loading('Request sent – Waiting for employee device...');
+    const todayStr = new Date().toISOString().split('T')[0];
+    setSelectedRouteDate(todayStr);
+
+    // Pre-fetch stored MongoDB records to ensure admin immediately sees location history
+    await handleOpenRouteMap(todayStr, true);
+
     try {
       const res = await attendanceService.requestLiveLocation(id);
       const requestId = res.data?.requestId;
 
-      const todayStr = new Date().toISOString().split('T')[0];
-      setSelectedRouteDate(todayStr);
-
       if (!requestId) {
         toast.dismiss(toastId);
-        toast.error('Failed to dispatch live request.');
+        toast('Live request signal dispatched. Displaying stored records from database.', { icon: 'ℹ️' });
         setLiveRequesting(false);
+        await handleOpenRouteMap(todayStr, false);
         return;
       }
 
@@ -138,7 +142,7 @@ const EmployeeHistory = () => {
       const pollTimer = setInterval(async () => {
         attempts++;
         try {
-          const statusRes = await attendanceService.getLiveRequestStatus(requestId);
+          const statusRes = await attendanceService.getLiveRequestStatus(requestId, id);
           const sData = statusRes.data;
 
           if (sData?.stage === 'received') {
@@ -156,11 +160,11 @@ const EmployeeHistory = () => {
           } else if (sData?.status === 'failed' || sData?.status === 'expired' || attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setLiveRequesting(false);
-            toast.error(
+            toast(
               sData?.errorMessage 
-                ? `Sync failed: ${sData.errorMessage}` 
-                : 'Employee device unavailable or background sync timed out.',
-              { id: toastId }
+                ? `Device sync status: ${sData.errorMessage}. Showing last stored location.` 
+                : 'Employee device offline or unreachable. Loaded last stored GPS records from database.',
+              { id: toastId, icon: '⚠️' }
             );
             await handleOpenRouteMap(todayStr, false);
           }
@@ -168,7 +172,7 @@ const EmployeeHistory = () => {
           if (attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setLiveRequesting(false);
-            toast.error('Employee device unavailable or timed out.', { id: toastId });
+            toast('Employee device offline or unreachable. Loaded last stored GPS records from database.', { id: toastId, icon: '⚠️' });
             await handleOpenRouteMap(todayStr, false);
           }
         }
@@ -176,8 +180,9 @@ const EmployeeHistory = () => {
 
     } catch (err) {
       toast.dismiss(toastId);
-      toast.error(err.response?.data?.message || 'Failed to request live location');
+      toast(err.response?.data?.message || 'Device unreachable. Loaded last stored GPS records.', { icon: '⚠️' });
       setLiveRequesting(false);
+      await handleOpenRouteMap(todayStr, false);
     }
   };
 

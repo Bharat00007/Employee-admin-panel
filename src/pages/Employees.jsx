@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Users, UserPlus, Search, ChevronLeft, ChevronRight, Loader2, Power, Eye, KeyRound, Radio, MapPin } from 'lucide-react';
+import { Users, UserPlus, Search, ChevronLeft, ChevronRight, Loader2, Power, Eye, KeyRound, Radio, MapPin, Pencil, Activity } from 'lucide-react';
 import { employeeService } from '../services/employee.service';
 import AddEmployeeModal from '../components/AddEmployeeModal';
+import EditEmployeeModal from '../components/EditEmployeeModal';
 import ResetPasswordModal from '../components/ResetPasswordModal';
 import MapModal from '../components/MapModal';
 import toast from 'react-hot-toast';
@@ -12,6 +13,7 @@ const Employees = () => {
   const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editModalEmployee, setEditModalEmployee] = useState(null);
   const [resetModalEmployee, setResetModalEmployee] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [mapModal, setMapModal] = useState({ isOpen: false, routeData: null, isLoading: false, title: '' });
@@ -75,25 +77,30 @@ const Employees = () => {
     setLiveLoadingId(emp._id);
     const todayStr = new Date().toISOString().split('T')[0];
     const toastId = toast.loading(`Request sent – Waiting for ${emp.name}'s device...`);
+
+    // Immediately fetch and open latest stored GPS records from MongoDB
+    try {
+      const initialRouteRes = await attendanceService.getRouteHistory(emp._id, todayStr);
+      setMapModal({
+        isOpen: true,
+        routeData: initialRouteRes.data,
+        isLoading: false,
+        title: `Live Tracking: ${emp.name}`
+      });
+    } catch (_initialErr) {
+      console.warn('Could not pre-fetch route history:', _initialErr.message);
+    }
+
     try {
       const res = await attendanceService.requestLiveLocation(emp._id);
       const requestId = res.data?.requestId;
 
       if (!requestId) {
         toast.dismiss(toastId);
-        toast.error('Failed to dispatch live request.');
+        toast('Live request signal dispatched. Displaying stored records.', { icon: 'ℹ️' });
         setLiveLoadingId(null);
         return;
       }
-
-      // First open the current map immediately
-      const routeRes = await attendanceService.getRouteHistory(emp._id, todayStr);
-      setMapModal({
-        isOpen: true,
-        routeData: routeRes.data,
-        isLoading: false,
-        title: `Live Tracking: ${emp.name}`
-      });
 
       // Poll status every 1.5s up to 20 seconds
       let attempts = 0;
@@ -101,7 +108,7 @@ const Employees = () => {
       const pollTimer = setInterval(async () => {
         attempts++;
         try {
-          const statusRes = await attendanceService.getLiveRequestStatus(requestId);
+          const statusRes = await attendanceService.getLiveRequestStatus(requestId, emp._id);
           const sData = statusRes.data;
 
           if (sData?.stage === 'received') {
@@ -123,26 +130,42 @@ const Employees = () => {
           } else if (sData?.status === 'failed' || sData?.status === 'expired' || attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setLiveLoadingId(null);
-            toast.error(
+            // Decouple device timeout from database display
+            toast(
               sData?.errorMessage 
-                ? `Sync failed: ${sData.errorMessage}` 
-                : `${emp.name}'s device unavailable or timed out.`,
-              { id: toastId }
+                ? `${emp.name}'s device status: ${sData.errorMessage}. Showing last stored location.` 
+                : `${emp.name}'s device offline or unreachable. Loaded last stored GPS records.`,
+              { id: toastId, icon: '⚠️' }
             );
+            const freshRes = await attendanceService.getRouteHistory(emp._id, todayStr);
+            setMapModal(prev => ({
+              ...prev,
+              routeData: freshRes.data
+            }));
           }
         } catch (_pollErr) {
           if (attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setLiveLoadingId(null);
-            toast.error(`${emp.name}'s device unavailable or timed out.`, { id: toastId });
+            toast(`${emp.name}'s device offline or timed out. Loaded last stored GPS records.`, { id: toastId, icon: '⚠️' });
+            const freshRes = await attendanceService.getRouteHistory(emp._id, todayStr);
+            setMapModal(prev => ({
+              ...prev,
+              routeData: freshRes.data
+            }));
           }
         }
       }, 1500);
 
     } catch (err) {
       toast.dismiss(toastId);
-      toast.error(err.response?.data?.message || 'Failed to request live location');
+      toast(err.response?.data?.message || 'Device unreachable. Loaded last stored GPS records.', { icon: '⚠️' });
       setLiveLoadingId(null);
+      const freshRes = await attendanceService.getRouteHistory(emp._id, todayStr);
+      setMapModal(prev => ({
+        ...prev,
+        routeData: freshRes.data
+      }));
     }
   };
 
@@ -209,8 +232,9 @@ const Employees = () => {
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 text-xs uppercase tracking-wider">
-                  <th className="p-4 font-semibold">Name</th>
+                  <th className="p-4 font-semibold">Employee</th>
                   <th className="p-4 font-semibold">Email</th>
+                  <th className="p-4 font-semibold">GPS Tracking Health</th>
                   <th className="p-4 font-semibold">Hire Date</th>
                   <th className="p-4 font-semibold text-center">Total Attendances</th>
                   <th className="p-4 font-semibold">Role</th>
@@ -221,8 +245,55 @@ const Employees = () => {
               <tbody className="divide-y divide-slate-100 text-sm">
                 {filteredEmployees.map((emp) => (
                   <tr key={emp._id} className="hover:bg-slate-50/50 transition-colors">
-                    <td className="p-4 font-medium text-slate-900">{emp.name}</td>
+                    <td className="p-4">
+                      <div className="font-semibold text-slate-900">{emp.name}</div>
+                      <div className="text-xs text-indigo-600 font-mono flex items-center gap-1">
+                        <span>@{emp.username || 'no-username'}</span>
+                      </div>
+                    </td>
                     <td className="p-4 text-slate-600">{emp.email}</td>
+                    <td className="p-4">
+                      {emp.trackingHealth === 'HEALTHY' ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse" />
+                            Tracking Healthy
+                          </span>
+                          <span className="text-[10px] text-slate-400">
+                            {emp.lastSeenAgoSeconds !== null ? `${Math.round(emp.lastSeenAgoSeconds / 60)}m ago` : 'Live'}
+                          </span>
+                        </div>
+                      ) : emp.trackingHealth === 'DELAYED' ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                            GPS Delayed
+                          </span>
+                          <span className="text-[10px] text-slate-400">
+                            {emp.lastSeenAgoSeconds !== null ? `${Math.round(emp.lastSeenAgoSeconds / 60)}m ago` : 'Delayed'}
+                          </span>
+                        </div>
+                      ) : emp.trackingHealth === 'POOR_ACCURACY' ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200">
+                            Poor Accuracy (±{Math.round(emp.latestLocation?.accuracy)}m)
+                          </span>
+                        </div>
+                      ) : emp.trackingHealth === 'OFFLINE' ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600 border border-slate-200">
+                            Device Offline
+                          </span>
+                          <span className="text-[10px] text-slate-400">
+                            {emp.latestLocation?.recordedAt ? new Date(emp.latestLocation.recordedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'No pings today'}
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs text-slate-500 bg-slate-50 border border-slate-200">
+                          Awaiting Fix
+                        </span>
+                      )}
+                    </td>
                     <td className="p-4 text-slate-600">
                       {emp.hireDate ? new Date(emp.hireDate).toLocaleDateString() : new Date(emp.createdAt).toLocaleDateString()}
                     </td>
@@ -259,6 +330,13 @@ const Employees = () => {
                             ) : (
                               <Radio className="h-4 w-4" />
                             )}
+                          </button>
+                          <button 
+                            onClick={() => setEditModalEmployee(emp)}
+                            className="p-1.5 rounded-md transition-colors text-slate-400 hover:text-indigo-600 hover:bg-indigo-50"
+                            title="Edit Username & Profile"
+                          >
+                            <Pencil className="h-4 w-4" />
                           </button>
                           <button 
                             onClick={() => navigate(`/employees/${emp._id}/attendance`)}
@@ -326,6 +404,12 @@ const Employees = () => {
         isOpen={isModalOpen} 
         onClose={() => setIsModalOpen(false)} 
         onEmployeeAdded={fetchEmployees}
+      />
+      <EditEmployeeModal
+        isOpen={!!editModalEmployee}
+        onClose={() => setEditModalEmployee(null)}
+        employee={editModalEmployee}
+        onEmployeeUpdated={fetchEmployees}
       />
       <ResetPasswordModal
         isOpen={!!resetModalEmployee}

@@ -19,5 +19,10 @@ export const employeeService = {
   resetEmployeePassword: async (id, newPassword) => {
     const response = await api.patch(`/employees/${id}/reset-password`, { newPassword });
     return response.data;
+  },
+
+  updateEmployee: async (id, data) => {
+    const response = await api.patch(`/employees/${id}`, data);
+    return response.data;
   }
 };

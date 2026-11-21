@@ -1,23 +1,55 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { 
   X, Navigation, Clock, MapPin, Activity, AlertCircle, Loader2, 
-  User, RefreshCw, Camera, Route, Radio, ExternalLink, ShieldAlert
+  User, RefreshCw, Camera, Route, Radio, ExternalLink, ShieldAlert,
+  AlertTriangle, CheckCircle, Check
 } from 'lucide-react';
 import { loadGoogleMapsAPI } from '../services/googleMapsLoader';
 import { attendanceService } from '../services/attendance.service';
 import toast from 'react-hot-toast';
 
-// Google Maps Custom SVG Marker Pin (Distinguishable Camera Pin for Photos vs Waypoints)
-const createGoogleMarkerIcon = (text, isPhoto = false) => {
-  const bgColor = isPhoto ? '#7C3AED' : '#4F46E5';
-  const width = isPhoto ? 36 : 30;
-  const height = isPhoto ? 46 : 38;
+// Google Maps Custom SVG Marker Pin supporting Start, End, Photos, Verified, and Unverified GPS
+const createGoogleMarkerIcon = (text, isPhoto = false, verificationStatus = 'VERIFIED', isStart = false, isEnd = false) => {
+  let bgColor = '#4F46E5'; // Default indigo
+  let textColor = '#ffffff';
+
+  if (isPhoto) {
+    bgColor = '#7C3AED'; // Purple
+  } else if (isStart) {
+    bgColor = '#10B981'; // Emerald Start
+  } else if (isEnd) {
+    bgColor = '#1E293B'; // Slate-900 End
+  } else if (verificationStatus === 'UNVERIFIED_GPS') {
+    bgColor = '#F59E0B'; // Amber Unverified
+  } else if (verificationStatus === 'VERIFIED_BY_ADMIN') {
+    bgColor = '#059669'; // Green Verified by Admin
+  } else if (verificationStatus === 'REJECTED_BY_ADMIN') {
+    bgColor = '#EF4444'; // Red Rejected by Admin
+  }
+
+  const width = isPhoto ? 36 : (isStart || isEnd ? 34 : 30);
+  const height = isPhoto ? 46 : (isStart || isEnd ? 44 : 38);
 
   let centerContent = '';
   if (isPhoto) {
     centerContent = `
       <circle cx="18" cy="16" r="11" fill="#ffffff" />
       <text x="18" y="20.5" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">📷</text>
+    `;
+  } else if (isStart) {
+    centerContent = `
+      <circle cx="17" cy="15" r="10" fill="#ffffff" />
+      <text x="17" y="19" font-size="9" font-weight="bold" font-family="Arial, sans-serif" fill="${bgColor}" text-anchor="middle">START</text>
+    `;
+  } else if (isEnd) {
+    centerContent = `
+      <circle cx="17" cy="15" r="10" fill="#ffffff" />
+      <text x="17" y="19" font-size="9" font-weight="bold" font-family="Arial, sans-serif" fill="${bgColor}" text-anchor="middle">END</text>
+    `;
+  } else if (verificationStatus === 'UNVERIFIED_GPS') {
+    centerContent = `
+      <circle cx="15" cy="14" r="9.5" fill="#ffffff" />
+      <text x="15" y="17.5" font-size="10" font-weight="bold" font-family="Arial, sans-serif" fill="${bgColor}" text-anchor="middle">⚠️</text>
     `;
   } else {
     centerContent = `
@@ -34,6 +66,16 @@ const createGoogleMarkerIcon = (text, isPhoto = false) => {
         </filter>
       </defs>
       <path d="M18 0C8.06 0 0 8.06 0 18c0 13.5 16.5 27 17.2 27.5.5.4 1.1.4 1.6 0 .7-.5 17.2-14 17.2-27.5C36 8.06 27.94 0 18 0z" fill="${bgColor}" stroke="#ffffff" stroke-width="2.5" filter="url(#shadow)"/>
+      ${centerContent}
+    </svg>
+  ` : (isStart || isEnd) ? `
+    <svg xmlns="http://www.w3.org/2000/svg" width="34" height="44" viewBox="0 0 34 44">
+      <defs>
+        <filter id="shadow-se" x="-20%" y="-10%" width="140%" height="130%">
+          <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000000" flood-opacity="0.35"/>
+        </filter>
+      </defs>
+      <path d="M17 0C7.61 0 0 7.61 0 17c0 12.5 15.5 25.5 16.2 26 .5.4 1.1.4 1.6 0 .7-.5 16.2-13.5 16.2-26C34 7.61 26.39 0 17 0z" fill="${bgColor}" stroke="#ffffff" stroke-width="2.5" filter="url(#shadow-se)"/>
       ${centerContent}
     </svg>
   ` : `
@@ -111,6 +153,7 @@ const MapModal = ({
   const googleMapRef = useRef(null);
   const mapInstanceRef = useRef(null);
   const markersRef = useRef([]);
+  const polylinesRef = useRef([]);
 
   const [googleMapLoaded, setGoogleMapLoaded] = useState(false);
   const [googleMapError, setGoogleMapError] = useState(null);
@@ -120,7 +163,27 @@ const MapModal = ({
   const lastRefreshedTotalRef = useRef(0);
   const [accumulatedSinceRefresh, setAccumulatedSinceRefresh] = useState(0);
 
-  // Retrieve Google Maps API Key from environment variables (supports VITE_ and fallback)
+  // Clear all overlays helper
+  const clearMapOverlays = useCallback(() => {
+    if (markersRef.current && markersRef.current.length > 0) {
+      markersRef.current.forEach(m => {
+        try {
+          if (m && typeof m.setMap === 'function') m.setMap(null);
+        } catch (_e) {}
+      });
+      markersRef.current = [];
+    }
+    if (polylinesRef.current && polylinesRef.current.length > 0) {
+      polylinesRef.current.forEach(p => {
+        try {
+          if (p && typeof p.setMap === 'function') p.setMap(null);
+        } catch (_e) {}
+      });
+      polylinesRef.current = [];
+    }
+  }, []);
+
+  // Retrieve Google Maps API Key from environment variables
   const apiKey = (
     import.meta.env.VITE_GOOGLE_MAPS_API_KEY || 
     import.meta.env.VITE_GOOGLE_MAPS_JAVASCRIPT_API_KEY || 
@@ -143,6 +206,9 @@ const MapModal = ({
       accuracy: loc.accuracy || null,
       recordedAt: loc.time || loc.recordedAt || new Date().toISOString(),
       type: idx === 0 ? 'photo_checkin' : 'waypoint',
+      verificationStatus: loc.verificationStatus || 'VERIFIED',
+      verificationReason: loc.verificationReason || 'REALTIME_STREAM',
+      serverReceivedAt: loc.serverReceivedAt || null,
       address: loc.address || '',
       imageUrl: loc.imageUrl || null
     }));
@@ -160,7 +226,9 @@ const MapModal = ({
       accuracy: null,
       address: address || '',
       recordedAt: new Date().toISOString(),
-      type: 'photo_checkin'
+      type: 'photo_checkin',
+      verificationStatus: 'VERIFIED',
+      verificationReason: 'PHOTO_CHECKIN_VERIFIED'
     }];
     summary = {
       totalPoints: 1,
@@ -181,6 +249,11 @@ const MapModal = ({
     });
   }, [rawRoute]);
 
+  // Unverified Points Count
+  const unverifiedCount = useMemo(() => {
+    return (rawRoute || []).filter(pt => pt.verificationStatus === 'UNVERIFIED_GPS').length;
+  }, [rawRoute]);
+
   // 2) Handle Coordinates with spiderfying / radial micro-offset for identical locations
   const processedPoints = useMemo(() => {
     const validPoints = (rawRoute || []).filter(pt => {
@@ -188,7 +261,6 @@ const MapModal = ({
       const pLat = parseFloat(pt.lat);
       const pLng = parseFloat(pt.lng);
       if (isNaN(pLat) || isNaN(pLng)) return false;
-      // Filter out invalid (0, 0) coordinates
       if (pLat === 0 && pLng === 0) return false;
       return true;
     }).map(pt => ({
@@ -196,6 +268,9 @@ const MapModal = ({
       lat: parseFloat(pt.lat),
       lng: parseFloat(pt.lng)
     }));
+
+    // Ensure chronological sort
+    validPoints.sort((a, b) => new Date(a.recordedAt) - new Date(b.recordedAt));
 
     const coordGroups = {};
     validPoints.forEach((pt) => {
@@ -205,9 +280,12 @@ const MapModal = ({
     });
 
     let waypointCounter = 1;
+    const totalValid = validPoints.length;
 
-    return validPoints.map((pt) => {
+    return validPoints.map((pt, idx) => {
       const isPhoto = pt.type === 'photo_checkin' || !!pt.imageUrl;
+      const isStart = idx === 0 && totalValid > 1 && !isPhoto;
+      const isEnd = idx === totalValid - 1 && totalValid > 1 && !isPhoto;
       const sequenceNumber = isPhoto ? '📷' : waypointCounter++;
 
       const key = `${pt.lat.toFixed(6)},${pt.lng.toFixed(6)}`;
@@ -217,9 +295,8 @@ const MapModal = ({
 
       if (group.length > 1) {
         const itemIdx = group.indexOf(pt);
-        const radius = 0.00035; // ~38m radial spiderfy offset (~12-16px on map) so overlapping waypoints and photos are clearly visible side-by-side
+        const radius = 0.00035;
         if (group.length === 2) {
-          // Split horizontally east/west so waypoint (#N) and photo (📷) stand side-by-side
           const offsetLng = (itemIdx === 0 ? -radius : radius) / Math.cos((pt.lat * Math.PI) / 180);
           displayLng = pt.lng + offsetLng;
         } else {
@@ -234,7 +311,9 @@ const MapModal = ({
         displayLat,
         displayLng,
         sequenceNumber,
-        isPhoto
+        isPhoto,
+        isStart,
+        isEnd
       };
     });
   }, [rawRoute]);
@@ -267,14 +346,14 @@ const MapModal = ({
     }
   }, [routeData]);
 
-  // 4) Map Refresh Policy: Only fetch full map history when 100 new records have been stored in MongoDB
-  // GPS uploads continue independently every ~60s; Admin Panel does NOT refetch on every upload.
+  // 4) Map Refresh Policy: 100-new-record map refresh threshold
   useEffect(() => {
-    if (!isOpen || !employee?.id || !onRefreshRoute || !summary.isTrackingActive) return;
+    const empId = employee?.id || employee?._id;
+    if (!isOpen || !empId || !onRefreshRoute || !summary.isTrackingActive) return;
 
     const checkInterval = setInterval(async () => {
       try {
-        const countRes = await attendanceService.getRecordCount(employee.id, routeData?.date);
+        const countRes = await attendanceService.getRecordCount(empId, routeData?.date);
         const currentDbTotal = countRes.data?.totalCount || 0;
         const baseline = lastRefreshedTotalRef.current || 0;
         const newAccumulated = Math.max(0, currentDbTotal - baseline);
@@ -285,8 +364,6 @@ const MapModal = ({
           lastRefreshedTotalRef.current = currentDbTotal;
           setAccumulatedSinceRefresh(0);
           await onRefreshRoute(false);
-        } else {
-          console.log(`[GPS_MAP_THROTTLE] Buffer: ${newAccumulated}/100 new records stored in DB. Map refresh held to prevent unnecessary API calls.`);
         }
       } catch (err) {
         console.warn('[GPS_MAP_CHECK] Failed to check record count:', err.message);
@@ -294,9 +371,29 @@ const MapModal = ({
     }, 30000);
 
     return () => clearInterval(checkInterval);
-  }, [isOpen, employee?.id, onRefreshRoute, summary.isTrackingActive, routeData?.date]);
+  }, [isOpen, employee, onRefreshRoute, summary.isTrackingActive, routeData?.date]);
 
-  // 5) Initialize Google Maps JavaScript API with size-guard and lifecycle management
+  // 5) Global Admin Review Record Handler (invoked from InfoWindow buttons)
+  useEffect(() => {
+    const handleReviewEvent = async (e) => {
+      const { recordId, status } = e.detail || {};
+      if (!recordId || !status) return;
+      try {
+        toast.loading('Updating record verification status...', { id: 'review_toast' });
+        await attendanceService.reviewRecord(recordId, status);
+        toast.success(`Record marked as ${status.replace(/_/g, ' ')}!`, { id: 'review_toast' });
+        if (onRefreshRoute) {
+          await onRefreshRoute(true);
+        }
+      } catch (err) {
+        toast.error(err.response?.data?.message || 'Failed to update record status', { id: 'review_toast' });
+      }
+    };
+    window.addEventListener('gotails_review_record', handleReviewEvent);
+    return () => window.removeEventListener('gotails_review_record', handleReviewEvent);
+  }, [onRefreshRoute]);
+
+  // 6) Initialize Google Maps JavaScript API and Render Route & Markers
   useEffect(() => {
     if (!isOpen || !hasPoints || isLoading || authError) return;
 
@@ -312,9 +409,12 @@ const MapModal = ({
       .then((google) => {
         if (!isMounted || !googleMapRef.current) return;
 
-        // Clean up previous markers if any
+        // Clean up previous markers and polylines
         markersRef.current.forEach(m => m.setMap(null));
         markersRef.current = [];
+
+        polylinesRef.current.forEach(p => p.setMap(null));
+        polylinesRef.current = [];
 
         const center = {
           lat: processedPoints[0].displayLat,
@@ -342,33 +442,200 @@ const MapModal = ({
         const bounds = new google.maps.LatLngBounds();
         const infoWindow = new google.maps.InfoWindow();
 
-        // Render independent markers for EVERY valid GPS record (NO Polylines)
+        // RENDER ONE ROUTE PATH
+        // Prefer best available road-matched geometry; fallback to recorded points with 20-min gap breaks
+        const roadSegments = routeData?.roadMatchedSegments || [];
+        const hasRoadMatchedSegments = roadSegments.length > 0 && roadSegments.some(s => s.path && s.path.length >= 2);
+
+        if (hasRoadMatchedSegments) {
+          roadSegments.forEach((segment) => {
+            if (!segment.path || segment.path.length < 2) return;
+            const path = segment.path.map(p => ({ lat: p.lat, lng: p.lng }));
+            const isUnverified = segment.verificationStatus === 'UNVERIFIED_GPS';
+
+            if (isUnverified) {
+              // Unverified offline travel rendered with distinct dashed amber styling
+              const dashedLine = new google.maps.Polyline({
+                path,
+                geodesic: true,
+                strokeOpacity: 0,
+                icons: [{
+                  icon: {
+                    path: 'M 0,-1 0,1',
+                    strokeOpacity: 1,
+                    scale: 3,
+                    strokeColor: '#F59E0B'
+                  },
+                  offset: '0',
+                  repeat: '14px'
+                }],
+                map,
+                zIndex: 40
+              });
+              polylinesRef.current.push(dashedLine);
+            } else {
+              // High-definition road-matched solid indigo polyline conforming to road curvature
+              const solidLine = new google.maps.Polyline({
+                path,
+                geodesic: true,
+                strokeColor: '#4F46E5',
+                strokeOpacity: 0.9,
+                strokeWeight: 5,
+                map,
+                zIndex: 35
+              });
+              polylinesRef.current.push(solidLine);
+            }
+          });
+        } else {
+          // Fallback: single route path directly from waypoints with 20-minute gap breaks
+          const routeWaypoints = processedPoints.filter(p => !p.isPhoto);
+
+          if (routeWaypoints.length >= 2) {
+            const MAX_GAP_MS = 20 * 60 * 1000;
+            let currentSegment = [routeWaypoints[0]];
+
+            const renderRawSegment = (segmentPoints) => {
+              if (segmentPoints.length < 2) return;
+              const hasUnverified = segmentPoints.some(p => p.verificationStatus === 'UNVERIFIED_GPS');
+              const path = segmentPoints.map(p => ({ lat: p.lat, lng: p.lng }));
+
+              if (hasUnverified) {
+                const dashedLine = new google.maps.Polyline({
+                  path,
+                  geodesic: true,
+                  strokeOpacity: 0,
+                  icons: [{
+                    icon: {
+                      path: 'M 0,-1 0,1',
+                      strokeOpacity: 1,
+                      scale: 3,
+                      strokeColor: '#F59E0B'
+                    },
+                    offset: '0',
+                    repeat: '14px'
+                  }],
+                  map,
+                  zIndex: 40
+                });
+                polylinesRef.current.push(dashedLine);
+              } else {
+                const rawLine = new google.maps.Polyline({
+                  path,
+                  geodesic: true,
+                  strokeColor: '#4F46E5',
+                  strokeOpacity: 0.85,
+                  strokeWeight: 4,
+                  map,
+                  zIndex: 30
+                });
+                polylinesRef.current.push(rawLine);
+              }
+            };
+
+            for (let i = 1; i < routeWaypoints.length; i++) {
+              const prev = routeWaypoints[i - 1];
+              const curr = routeWaypoints[i];
+              const timeDiff = Math.abs(new Date(curr.recordedAt).getTime() - new Date(prev.recordedAt).getTime());
+
+              if (timeDiff > MAX_GAP_MS) {
+                renderRawSegment(currentSegment);
+                currentSegment = [curr];
+              } else {
+                currentSegment.push(curr);
+              }
+            }
+            renderRawSegment(currentSegment);
+          }
+        }
+
+        // Render markers for EVERY valid GPS record (preserving accessibility and individual inspection)
         processedPoints.forEach((point) => {
           const isPhoto = point.isPhoto;
+          const isStart = point.isStart;
+          const isEnd = point.isEnd;
+          const verificationStatus = point.verificationStatus || 'VERIFIED';
           const position = { lat: point.displayLat, lng: point.displayLng };
           bounds.extend(position);
 
           const marker = new google.maps.Marker({
             position,
             map,
-            title: isPhoto ? 'Check-in Photograph' : `Waypoint #${point.sequenceNumber}`,
-            icon: createGoogleMarkerIcon(isPhoto ? '📷' : String(point.sequenceNumber), isPhoto),
-            zIndex: isPhoto ? 1000 : Number(point.sequenceNumber) || 10
+            title: isPhoto ? 'Check-in Photograph' : (isStart ? 'Journey Start' : (isEnd ? 'Latest Point' : `Waypoint #${point.sequenceNumber}`)),
+            icon: createGoogleMarkerIcon(
+              isPhoto ? '📷' : String(point.sequenceNumber), 
+              isPhoto, 
+              verificationStatus, 
+              isStart, 
+              isEnd
+            ),
+            zIndex: isPhoto ? 1000 : (isStart || isEnd ? 500 : (verificationStatus === 'UNVERIFIED_GPS' ? 200 : 100))
           });
 
           markersRef.current.push(marker);
 
+          // Build Verification Status Badge
+          let verificationHtml = '';
+          if (verificationStatus === 'UNVERIFIED_GPS') {
+            verificationHtml = `
+              <div style="background-color: #fef3c7; border: 1.5px solid #f59e0b; color: #92400e; padding: 6px; border-radius: 6px; font-size: 11px; margin: 6px 0;">
+                <div style="font-weight: 700; display: flex; align-items: center; gap: 4px;">
+                  ⚠️ UNVERIFIED_GPS (Captured Offline)
+                </div>
+                <div style="font-size: 10px; color: #b45309; margin-top: 2px;">
+                  <b>Reason:</b> ${escapeHtml(point.verificationReason || 'Buffered offline, uploaded upon reconnection')}
+                </div>
+                ${point.serverReceivedAt ? `<div style="font-size: 10px; color: #78350f; margin-top: 2px;"><b>Server Received:</b> ${formatTime(point.serverReceivedAt)}</div>` : ''}
+                <div style="display: flex; gap: 6px; margin-top: 6px; border-top: 1px dashed #fcd34d; padding-top: 4px;">
+                  <button 
+                    onclick="window.dispatchEvent(new CustomEvent('gotails_review_record', { detail: { recordId: '${point._id}', status: 'VERIFIED_BY_ADMIN' } }))"
+                    style="background: #059669; color: white; border: none; border-radius: 4px; padding: 3px 8px; font-size: 10px; font-weight: 700; cursor: pointer;"
+                  >
+                    ✓ Mark Verified
+                  </button>
+                  <button 
+                    onclick="window.dispatchEvent(new CustomEvent('gotails_review_record', { detail: { recordId: '${point._id}', status: 'REJECTED_BY_ADMIN' } }))"
+                    style="background: #dc2626; color: white; border: none; border-radius: 4px; padding: 3px 8px; font-size: 10px; font-weight: 700; cursor: pointer;"
+                  >
+                    ✕ Reject
+                  </button>
+                </div>
+              </div>
+            `;
+          } else if (verificationStatus === 'VERIFIED_BY_ADMIN') {
+            verificationHtml = `
+              <div style="background-color: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; padding: 3px 6px; border-radius: 4px; font-size: 10px; margin: 4px 0; font-weight: 600;">
+                ✓ Verified by Admin
+              </div>
+            `;
+          } else if (verificationStatus === 'REJECTED_BY_ADMIN') {
+            verificationHtml = `
+              <div style="background-color: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 3px 6px; border-radius: 4px; font-size: 10px; margin: 4px 0; font-weight: 600;">
+                ✕ Rejected by Admin
+              </div>
+            `;
+          } else {
+            verificationHtml = `
+              <div style="background-color: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin: 4px 0;">
+                ● Real-time Live Verified
+              </div>
+            `;
+          }
+
           const contentString = `
-            <div style="font-family: system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; max-width: 270px; line-height: 1.4; padding: 4px;">
+            <div style="font-family: system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; max-width: 280px; line-height: 1.4; padding: 4px;">
               <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 6px;">
-                <span style="background-color: ${isPhoto ? '#f3e8ff' : '#e0e7ff'}; color: ${isPhoto ? '#6b21a8' : '#3730a3'}; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">
-                  ${isPhoto ? '📷 Check-in Photograph' : 'Waypoint #' + point.sequenceNumber}
+                <span style="background-color: ${isPhoto ? '#f3e8ff' : (isStart ? '#dcfce7' : (isEnd ? '#f1f5f9' : '#e0e7ff'))}; color: ${isPhoto ? '#6b21a8' : (isStart ? '#15803d' : (isEnd ? '#0f172a' : '#3730a3'))}; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">
+                  ${isPhoto ? '📷 Check-in Photograph' : (isStart ? '▶ Journey Start' : (isEnd ? '🏁 Latest Point' : 'Waypoint #' + point.sequenceNumber))}
                 </span>
                 <span style="color: #64748b; font-size: 10px; font-family: monospace;">${formatTime(point.recordedAt)}</span>
               </div>
               <div style="font-weight: 700; color: #0f172a; margin-bottom: 2px;">
                 ${escapeHtml(employee?.name || 'Employee')} ${employee?.username ? '<span style="color: #4f46e5; font-family: monospace;">(@' + escapeHtml(employee.username) + ')</span>' : ''}
               </div>
+
+              ${verificationHtml}
+
               <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px; margin: 6px 0; font-family: monospace; font-size: 11px;">
                 <div><span style="color: #64748b;">Lat:</span> ${point.lat.toFixed(6)}</div>
                 <div><span style="color: #64748b;">Lng:</span> ${point.lng.toFixed(6)}</div>
@@ -377,8 +644,7 @@ const MapModal = ({
                 ${point.isStale ? '<div style="color: #dc2626; font-weight: bold; font-size: 10px;">⚠️ Stale Fix (>90s)</div>' : ''}
               </div>
               <div style="font-size: 11px; color: #475569;">
-                <div><b>Date:</b> ${formatDate(point.recordedAt)}</div>
-                <div><b>Time:</b> ${formatTime(point.recordedAt)}</div>
+                <div><b>Recorded At:</b> ${formatDate(point.recordedAt)} ${formatTime(point.recordedAt)}</div>
                 ${point.address ? '<div style="margin-top: 4px; color: #334155;">' + escapeHtml(point.address) + '</div>' : ''}
               </div>
               ${point.imageUrl ? `
@@ -414,7 +680,7 @@ const MapModal = ({
           }
         });
 
-        console.log(`[GPS_MAP_RENDER] Total Markers: ${processedPoints.length} | Waypoints: ${processedPoints.filter(p => !p.isPhoto).length} | Photos: ${processedPoints.filter(p => p.isPhoto).length}`);
+        console.log(`[GPS_MAP_RENDER] Total Markers: ${processedPoints.length} | Polylines: ${polylinesRef.current.length} | Unverified: ${unverifiedCount}`);
 
         // Trigger resize and fit bounds smoothly after modal animation settles
         resizeTimer = setTimeout(() => {
@@ -442,7 +708,7 @@ const MapModal = ({
       isMounted = false;
       if (resizeTimer) clearTimeout(resizeTimer);
     };
-  }, [isOpen, hasPoints, isLoading, apiKey, authError, processedPoints, employee]);
+  }, [isOpen, hasPoints, isLoading, apiKey, authError, processedPoints, employee, unverifiedCount, routeData, clearMapOverlays]);
 
   // Window event listener for photo clicks inside Google Maps InfoWindow
   useEffect(() => {
@@ -462,33 +728,35 @@ const MapModal = ({
   // Reset local state when modal closes
   useEffect(() => {
     if (!isOpen) {
+      clearMapOverlays();
       mapInstanceRef.current = null;
-      markersRef.current = [];
       setGoogleMapLoaded(false);
       setGoogleMapError(null);
       setAuthError(false);
       setModalLightboxImage(null);
     }
-  }, [isOpen]);
+  }, [isOpen, clearMapOverlays]);
 
-  // Handle Admin "Get Live Location" Click with multi-stage progress tracking
+  // TASK 1: Handle Admin "Get Live Location" Click with multi-stage progress tracking and decoupled database fallback
   const handleRequestLiveLocation = async () => {
-    if (!employee?.id) {
+    const empId = employee?.id || employee?._id;
+    if (!empId) {
       toast.error('No employee selected');
       return;
     }
     setIsRequestingLive(true);
-    console.log(`[GPS_LIVE_REQUEST] Admin requested live location for employee: ${employee?.id} (${employee?.name})`);
+    console.log(`[GPS_LIVE_REQUEST] Admin requested live location for employee: ${empId} (${employee?.name})`);
     const toastId = toast.loading('Request sent – Waiting for employee device...');
 
     try {
-      const res = await attendanceService.requestLiveLocation(employee.id);
+      const res = await attendanceService.requestLiveLocation(empId);
       const requestId = res.data?.requestId;
 
       if (!requestId) {
         toast.dismiss(toastId);
-        toast.error('Failed to dispatch live request.');
+        toast('Live request signal dispatched. Displaying stored records from database.', { icon: 'ℹ️' });
         setIsRequestingLive(false);
+        if (onRefreshRoute) await onRefreshRoute(true);
         return;
       }
 
@@ -498,7 +766,7 @@ const MapModal = ({
       const pollTimer = setInterval(async () => {
         attempts++;
         try {
-          const statusRes = await attendanceService.getLiveRequestStatus(requestId);
+          const statusRes = await attendanceService.getLiveRequestStatus(requestId, empId);
           const sData = statusRes.data;
 
           if (sData?.stage === 'received') {
@@ -519,26 +787,36 @@ const MapModal = ({
           } else if (sData?.status === 'failed' || sData?.status === 'expired' || attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setIsRequestingLive(false);
-            toast.error(
+            // Decouple device timeout from database display: always load MongoDB history
+            toast(
               sData?.errorMessage 
-                ? `Sync failed: ${sData.errorMessage}` 
-                : 'Employee device unavailable or background sync timed out.',
-              { id: toastId }
+                ? `Device sync status: ${sData.errorMessage}. Showing last stored location.` 
+                : 'Device offline or unreachable. Displaying latest stored GPS location from database.',
+              { id: toastId, icon: '⚠️' }
             );
+            if (onRefreshRoute) {
+              await onRefreshRoute(true);
+            }
           }
         } catch (_pollErr) {
           if (attempts >= maxAttempts) {
             clearInterval(pollTimer);
             setIsRequestingLive(false);
-            toast.error('Employee device unavailable or timed out.', { id: toastId });
+            toast('Device offline or unreachable. Displaying latest stored GPS location from database.', { id: toastId, icon: '⚠️' });
+            if (onRefreshRoute) {
+              await onRefreshRoute(true);
+            }
           }
         }
       }, 1500);
 
     } catch (err) {
       toast.dismiss(toastId);
-      toast.error(err.response?.data?.message || 'Failed to request live location');
+      toast(err.response?.data?.message || 'Device unreachable. Loaded last stored GPS records.', { icon: '⚠️' });
       setIsRequestingLive(false);
+      if (onRefreshRoute) {
+        await onRefreshRoute(true);
+      }
     }
   };
 
@@ -570,9 +848,6 @@ const MapModal = ({
                     Tracking Ended ({summary.configuredCutoffTime || '19:00'} IST)
                   </span>
                 )}
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-blue-100 text-blue-800 border border-blue-200">
-                  Google Maps
-                </span>
               </h3>
               <p className="text-xs text-slate-500 mt-0.5 flex items-center gap-2">
                 <User className="w-3.5 h-3.5 text-slate-400" />
@@ -588,7 +863,7 @@ const MapModal = ({
           
           <div className="flex items-center gap-2">
             {/* Get Live Location Button */}
-            {employee?.id && (
+            {(employee?.id || employee?._id) && (
               <button
                 type="button"
                 onClick={handleRequestLiveLocation}
@@ -616,7 +891,7 @@ const MapModal = ({
 
         {/* GPS Summary Metrics Section */}
         {hasPoints && (
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 px-6 py-3 bg-white border-b border-slate-100 text-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 px-6 py-3 bg-white border-b border-slate-100 text-xs">
             {/* Total Road Distance */}
             <div className="bg-indigo-50/60 p-2.5 rounded-xl border border-indigo-100">
               <div className="text-indigo-600 font-semibold flex items-center justify-between">
@@ -624,7 +899,7 @@ const MapModal = ({
                   <Route className="w-3.5 h-3.5 text-indigo-600" /> Road Distance
                 </span>
                 <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded font-mono">
-                  {summary.distanceCalculationMethod === 'google_directions_api' ? 'Directions API' : (isStationary ? 'Stationary Filter' : 'Estimated')}
+                  {summary.distanceCalculationMethod === 'google_snap_to_roads' ? 'Snap to Roads' : (summary.distanceCalculationMethod === 'google_directions_api' ? 'Directions API' : (isStationary ? 'Stationary Filter' : 'Estimated'))}
                 </span>
               </div>
               <div className="font-extrabold text-indigo-950 text-base mt-0.5 flex items-center gap-1.5 flex-wrap">
@@ -632,6 +907,11 @@ const MapModal = ({
                 {isStationary && (
                   <span className="text-[10px] font-semibold text-amber-700 bg-amber-100/80 px-1.5 py-0.5 rounded border border-amber-200">
                     Stationary / No travel
+                  </span>
+                )}
+                {summary.roadMatchingStatus && (
+                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${summary.roadMatchingStatus === 'ROAD_MATCHED' ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
+                    {summary.roadMatchingStatus}
                   </span>
                 )}
               </div>
@@ -666,6 +946,29 @@ const MapModal = ({
               </div>
             </div>
 
+            {/* Verification Status Breakdown */}
+            <div className={`p-2.5 rounded-xl border ${unverifiedCount > 0 ? 'bg-amber-50/70 border-amber-200' : 'bg-emerald-50/60 border-emerald-100'}`}>
+              <div className={`font-semibold flex items-center justify-between ${unverifiedCount > 0 ? 'text-amber-800' : 'text-emerald-700'}`}>
+                <span className="flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5" /> Verification
+                </span>
+              </div>
+              <div className="font-extrabold text-sm mt-0.5 flex items-center gap-1.5 flex-wrap">
+                {unverifiedCount > 0 ? (
+                  <span className="text-amber-900 flex items-center gap-1">
+                    ⚠️ {unverifiedCount} Unverified
+                  </span>
+                ) : (
+                  <span className="text-emerald-800 flex items-center gap-1">
+                    ✓ All Verified
+                  </span>
+                )}
+              </div>
+              <div className="text-[10px] text-slate-500 mt-0.5">
+                {unverifiedCount > 0 ? 'Captured offline' : 'Continuous stream'}
+              </div>
+            </div>
+
             {/* First Log */}
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
               <div className="text-slate-500 font-medium flex items-center gap-1">
@@ -697,6 +1000,35 @@ const MapModal = ({
           </div>
         )}
 
+        {/* Legend Banner */}
+        {hasPoints && (
+          <div className="px-6 py-1.5 bg-slate-50 border-b border-slate-200 text-[11px] text-slate-600 flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              <span className="font-bold text-slate-700">Map Legend:</span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span> Start
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-3 h-3 rounded-full bg-slate-900 inline-block"></span> End
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-4 h-1.5 bg-indigo-600 inline-block rounded"></span> Route Path
+              </span>
+              {unverifiedCount > 0 && (
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-4 h-1.5 border-b-2 border-dashed border-amber-500 inline-block"></span> Offline Travel
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1">
+                <span className="w-3 h-3 rounded-full bg-purple-600 inline-block"></span> 📷 Photo
+              </span>
+            </div>
+            <div className="text-[10px] text-slate-400">
+              Gaps &gt; 20 min not connected
+            </div>
+          </div>
+        )}
+
         {/* Warning if photos exist without GPS coordinates */}
         {photosWithoutCoordinates.length > 0 && (
           <div className="px-6 py-2 bg-amber-50 border-b border-amber-200 text-amber-900 text-xs flex items-center gap-2">
@@ -720,46 +1052,50 @@ const MapModal = ({
 
         {/* Map View / Loading / Empty / Error States */}
         <div className="flex-1 w-full relative bg-slate-100 overflow-hidden" style={{ minHeight: '400px' }}>
-          {isLoading ? (
+          {/* Layer 1: Google Maps JavaScript API Container (Always preserved in DOM) */}
+          <div 
+            ref={googleMapRef} 
+            style={{ width: '100%', height: '100%', minHeight: '400px' }}
+            className="w-full h-full absolute inset-0 bg-slate-100"
+          />
+
+          {/* Layer 2: Loading Overlay */}
+          {isLoading && (
             <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-white/80 backdrop-blur-xs">
               <Loader2 className="w-8 h-8 animate-spin text-indigo-600 mb-2" />
               <p className="text-sm font-semibold text-slate-600">Retrieving employee GPS coordinates...</p>
             </div>
-          ) : error ? (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center p-6 text-center">
+          )}
+
+          {/* Layer 3: Error State */}
+          {!isLoading && error && (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center p-6 text-center bg-white/95">
               <AlertCircle className="w-12 h-12 text-rose-500 mb-3" />
               <h4 className="font-bold text-slate-800 text-lg">Failed to Retrieve GPS History</h4>
               <p className="text-rose-600 text-sm max-w-sm mt-1">{error}</p>
             </div>
-          ) : !hasPoints ? (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center p-6 text-center">
+          )}
+
+          {/* Layer 4: Empty Route State */}
+          {!isLoading && !error && !hasPoints && (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center p-6 text-center bg-white/90">
               <AlertCircle className="w-12 h-12 text-slate-300 mb-3" />
               <h4 className="font-bold text-slate-700 text-lg">No GPS Coordinates Recorded</h4>
               <p className="text-slate-500 text-sm max-w-sm mt-1">
                 No location records were found for {employee?.name || 'this employee'} on {routeData?.date || 'the selected date'}.
               </p>
             </div>
-          ) : (authError || (!apiKey && googleMapError)) ? (
+          )}
+
+          {/* Layer 5: Google Maps API Configuration / Auth Error */}
+          {(authError || (!apiKey && googleMapError)) && (
             <div className="absolute inset-0 z-20 flex flex-col items-center justify-center p-6 text-center bg-white">
               <ShieldAlert className="w-12 h-12 text-rose-500 mb-3" />
               <h4 className="font-bold text-slate-800 text-lg">Google Maps Unavailable</h4>
               <p className="text-rose-600 text-sm max-w-md mt-1">
                 {googleMapError || 'The Google Maps JavaScript API could not be loaded.'}
               </p>
-              <div className="mt-4 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left max-w-md text-xs space-y-1.5 text-slate-600">
-                <p className="font-semibold text-slate-800">Troubleshooting Steps:</p>
-                <p>1. Ensure <code className="bg-slate-200 px-1 py-0.5 rounded text-indigo-700">VITE_GOOGLE_MAPS_API_KEY</code> is correctly set in <code className="bg-slate-200 px-1 py-0.5 rounded">admin_panel/.env</code>.</p>
-                <p>2. Verify "Maps JavaScript API" is enabled in Google Cloud Console.</p>
-                <p>3. If HTTP referrers are restricted, allow <code className="bg-slate-200 px-1 py-0.5 rounded">http://localhost:*</code>.</p>
-              </div>
             </div>
-          ) : (
-            /* Google Maps JavaScript API Container with solid fallback background */
-            <div 
-              ref={googleMapRef} 
-              style={{ width: '100%', height: '100%', minHeight: '400px' }}
-              className="w-full h-full absolute inset-0 bg-slate-100"
-            />
           )}
         </div>
       </div>
